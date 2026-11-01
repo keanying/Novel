@@ -20,14 +20,20 @@ import gen
 
 ROOT = ep1.ROOT
 FIRST = os.path.join(ROOT, "首帧")
-VIDEO = os.path.join(ROOT, "视频")
 VOICE = os.path.join(ROOT, "配音")
 MUSIC = os.path.join(ROOT, "音乐")
 LEGACY_STATE = os.path.join(ep1.WORK, "ep1_state.json")
 
+# 视频素材目录与成片文件名（可切换，用来并存 768P / 2K 两版）
+VIDEO_SUBDIR = os.environ.get("EP1_VIDEO_SUBDIR", "视频")
+VIDEO = os.path.join(ROOT, VIDEO_SUBDIR)
+OUT_NAME = os.environ.get("EP1_OUT_NAME", "E01_测灵_成片.mp4")
+
 
 def state_file(stage):
     """每个阶段一个独立状态文件，避免并发起跑时互相覆盖"""
+    if stage == "video":
+        return os.path.join(ep1.WORK, "ep1_video_%s.json" % VIDEO_SUBDIR)
     return os.path.join(ep1.WORK, "ep1_%s.json" % stage)
 
 
@@ -47,8 +53,8 @@ def save_state(stage, s):
 # 每镜出几版首帧
 VERSIONS = int(os.environ.get("EP1_VERSIONS", "2"))
 # 视频模型与参数（可由环境变量覆盖）
-VIDEO_MODEL = os.environ.get("EP1_VIDEO_MODEL", "MiniMax-H3-Max")
-VIDEO_RES = os.environ.get("EP1_VIDEO_RES", "768P")
+VIDEO_MODEL = os.environ.get("EP1_VIDEO_MODEL", "MiniMax-H3")
+VIDEO_RES = os.environ.get("EP1_VIDEO_RES", "2K")
 VIDEO_DUR = int(os.environ.get("EP1_VIDEO_DUR", "6"))
 
 for d in (ROOT, FIRST, VIDEO, VOICE, MUSIC):
@@ -225,8 +231,8 @@ def cmd_video():
                 print("  %s %s" % (key, status))
         save_state("video", st)
 
-        # 2) 提交下一段（受服务端并发配额限制，失败就等下一轮）
-        if queue:
+        # 2) 提交下一段（受服务端并发配额限制，填满配额就等下一轮）
+        while queue:
             no, key, frame, vid = queue[0]
             furl = get_url(frames_st[frame]["node_id"])
             args = {"model": VIDEO_MODEL, "prompt": vid, "duration": VIDEO_DUR,
@@ -237,7 +243,7 @@ def cmd_video():
             argsf = os.path.join(ep1.WORK, "_video_%02d.json" % no)
             gen.save_json(argsf, args)
             task_id = None
-            for attempt in range(4):
+            for attempt in range(3):
                 try:
                     r = cli(["mcode-tools", "connector", "call",
                              "connector__matrix__submit_video_generation",
@@ -249,15 +255,17 @@ def cmd_video():
                 task_id = r.get("task_id") or r.get("id")
                 if task_id:
                     break
+                if r.get("code") == 429:
+                    print("  S%02d 配额已满，等下一轮" % no)
+                    break
                 print("  S%02d 提交受限(第%d次)" % (no, attempt + 1))
                 time.sleep(10)
-            if task_id:
-                st[key] = {"task_id": task_id, "frame": frame, "status": "submitted"}
-                save_state("video", st)
-                print("  S%02d 提交成功 task=%s" % (no, task_id))
-                queue.pop(0)
-            else:
-                print("  S%02d 等待配额" % no)
+            if not task_id:
+                break            # 配额满：先轮询，释放后再提交
+            st[key] = {"task_id": task_id, "frame": frame, "status": "submitted"}
+            save_state("video", st)
+            print("  S%02d 提交成功 task=%s" % (no, task_id))
+            queue.pop(0)
 
         if queue or any(v.get("status") not in ("succeeded", "failed")
                         for v in st.values()):
@@ -435,6 +443,13 @@ def cmd_music():
 def cmd_assemble():
     st = {"tts": load_state("tts"), "music": load_state("music")}
     tl, total = ep1.timeline()
+    # 只剪指定镜头（做局部样片时用）：EP1_ONLY_SHOTS=1,2,3
+    only = os.environ.get("EP1_ONLY_SHOTS")
+    if only:
+        keep = set(int(x) for x in only.replace("，", ",").split(",") if x.strip())
+        ep1.SHOTS[:] = [s for s in ep1.SHOTS if s[0] in keep]
+        total = tl[max(keep)][1]
+        print("只剪镜头:", sorted(keep), "总长 %.1fs" % total)
     seg_dir = os.path.join(ep1.WORK, "e1seg")
     os.makedirs(seg_dir, exist_ok=True)
 
@@ -464,7 +479,7 @@ def cmd_assemble():
         seg = os.path.join(seg_dir, "S%02d.mp4" % no)
         # tpad: 源视频不足目标时长时克隆最后一帧补足；-t 精确裁到目标时长
         subprocess.run(["ffmpeg", "-y", "-i", src,
-                        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,"
                                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,"
                                "tpad=stop_mode=clone:stop_duration=8",
                         "-t", str(target),
@@ -534,11 +549,19 @@ def cmd_assemble():
            "fontcolor=white@0.55:fontsize=26:x=w-tw-28:y=40:box=1:"
            "boxcolor=black@0.28:boxborderw=6[vout]" % (ass_path, wm))
 
-    out = os.path.join(ROOT, "E01_测灵_成片.mp4")
+    out = os.path.join(ROOT, OUT_NAME)
+    # AIGC 隐式标识（合规要求）：显式水印之外还要在文件元数据里留生成方信息
+    aigc = ('AIGC={"Label":"1","ContentProducer":"MiniMax AI","ProduceID":"",'
+            '"ReservedCode1":"","ContentPropagator":"MiniMax AI",'
+            '"PropagateID":"","ReservedCode2":""}')
     cmd = ["ffmpeg", "-y", "-i", silent]
     cmd += inputs
     cmd += ["-filter_complex", ";".join([vfc] + mix),
             "-map", "[vout]", "-map", out_label,
+            "-metadata", aigc,
+            "-metadata", "title=凡骨问天 第01集 测灵",
+            "-metadata", "comment=本片由 AI 生成",
+            "-movflags", "+use_metadata_tags",
             "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest", out]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -665,7 +688,7 @@ def cmd_status():
     print("配音: %d 条" % len(st.get("tts", {})))
     print("配乐: %d 条" % len(st.get("music", {})))
     print("目标时长: %.1f 秒" % total)
-    out = os.path.join(ROOT, "E01_测灵_成片.mp4")
+    out = os.path.join(ROOT, OUT_NAME)
     if os.path.exists(out):
         print("成片已存在: %.1f MB" % (os.path.getsize(out) / 1024 / 1024))
         probe(out)
